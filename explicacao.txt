@@ -1,0 +1,373 @@
+================================================================================
+  EXPLICAÇÃO COMPLETA DO PROJETO: recaptcha-bypass-example
+  Gerado em: 26/05/2026
+================================================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. DEPENDÊNCIAS (requirements.txt + imports)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── playwright==1.47.0 (requirements.txt) ──────────────────────────────────────
+  Biblioteca principal do projeto. Playwright é um framework da Microsoft para
+  automação de browsers (Chromium, Firefox, WebKit). Diferente do Selenium, ele
+  tem suporte nativo a async, interceptação de rede, e é muito mais difícil de
+  detectar como bot. A versão 1.47.0 está fixada para garantir comportamento
+  reproduzível.
+
+  Após instalar via pip, é necessário rodar:
+    playwright install chromium
+  Isso baixa o binário do Chromium que o Playwright vai controlar.
+
+── asyncio (stdlib) ───────────────────────────────────────────────────────────
+  Módulo padrão do Python para programação assíncrona (async/await). Usado aqui
+  por dois motivos:
+    1. No Windows, o Playwright sync precisa do ProactorEventLoop para funcionar
+       corretamente com subprocessos.
+    2. A função login_async() usa asyncio para rodar o Playwright em thread
+       separada sem bloquear o loop de eventos principal (útil com FastAPI).
+
+── logging (stdlib) ───────────────────────────────────────────────────────────
+  Módulo padrão para registro de logs. Configurado com nível INFO e formato
+  "timestamp [NÍVEL] mensagem". Usado para informar o progresso do login:
+  abertura do browser, preenchimento do form, captura de cookies, erros, etc.
+
+── sys (stdlib) ────────────────────────────────────────────────────────────────
+  Módulo padrão de acesso a informações do sistema. Usado especificamente para
+  checar sys.platform == "win32" e aplicar a política de event loop correta no
+  Windows (WindowsProactorEventLoopPolicy).
+
+── argparse (stdlib) ──────────────────────────────────────────────────────────
+  Módulo padrão para parsing de argumentos de linha de comando. Permite executar
+  o script diretamente via terminal passando --url, --email, --senha, --success
+  e --no-headless como parâmetros.
+
+── concurrent.futures.ThreadPoolExecutor (stdlib) ─────────────────────────────
+  Gerenciador de pool de threads. Usado para rodar o Playwright (que é síncrono)
+  dentro de um contexto assíncrono sem bloquear o event loop do asyncio. Um
+  executor dedicado com max_workers=1 garante que apenas uma instância do
+  Playwright rode por vez.
+
+── playwright.sync_api (playwright) ───────────────────────────────────────────
+  API síncrona do Playwright. Importa:
+    - sync_playwright: context manager que inicializa o Playwright
+    - Browser: tipo que representa o browser aberto
+    - BrowserContext: tipo que representa um perfil/sessão isolada do browser
+    - Page: tipo que representa uma aba/página
+    - TimeoutError (como PlaywrightTimeoutError): exceção lançada quando uma
+      operação excede o tempo limite configurado
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FUNÇÕES — EXPLICAÇÃO DETALHADA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+────────────────────────────────────────────────────────────────────────────────
+FUNÇÃO: _do_login_sync()
+────────────────────────────────────────────────────────────────────────────────
+Assinatura:
+  def _do_login_sync(
+      login_url, email, senha, headless=True,
+      success_url_pattern, email_selector, senha_selector,
+      submit_selector, cookie_names
+  ) -> dict[str, str]
+
+Propósito:
+  Função principal do projeto. Abre um browser Chromium real, navega até a
+  página de login, preenche as credenciais, submete o formulário (disparando o
+  reCAPTCHA Invisible em background), aguarda o redirecionamento de sucesso e
+  captura os cookies de sessão.
+
+Parâmetros:
+  login_url           — URL completa da página de login
+  email               — email/usuário para autenticação
+  senha               — senha para autenticação
+  headless            — True = browser roda invisível | False = browser visível
+  success_url_pattern — padrão glob da URL após login bem-sucedido
+                        ex: "**/dashboard**" casa com qualquer URL que contenha
+                        "/dashboard/"
+  email_selector      — seletor CSS do campo de email no formulário
+  senha_selector      — seletor CSS do campo de senha no formulário
+  submit_selector     — seletor CSS do botão de submit
+  cookie_names        — lista de nomes de cookies a capturar; None = todos
+
+Retorno:
+  Dicionário { nome_do_cookie: valor_do_cookie } com os cookies de sessão
+
+Implementação passo a passo:
+
+  PASSO 0 — Compatibilidade Windows
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+    No Windows, o loop de eventos padrão (SelectorEventLoop) não suporta
+    subprocessos. O ProactorEventLoop é necessário para o Playwright funcionar.
+
+  PASSO 1 — Lança o browser disfarçado
+    browser = p.chromium.launch(
+        headless=headless,
+        args=[
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ]
+    )
+    - "--no-sandbox": necessário em ambientes sem root/admin
+    - "--disable-blink-features=AutomationControlled": remove a flag interna do
+      Chrome que indica ao site que o browser está sendo controlado por WebDriver.
+      Sem isso, document.documentElement.hasAttribute('webdriver') retorna true.
+
+  PASSO 2 — Cria contexto com identidade de usuário real
+    context = browser.new_context(
+        user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) ...",
+        viewport={"width": 1366, "height": 768},
+        locale="pt-BR",
+    )
+    - user_agent: string de um Chrome real no Windows. Browsers automatizados
+      costumam ter UAs genéricas ou com "HeadlessChrome" que são facilmente
+      detectadas.
+    - viewport: resolução comum de desktop. Resoluções incomuns são um sinal
+      de automação.
+    - locale: idioma pt-BR para simular usuário brasileiro.
+
+  PASSO 3 — Remove navigator.webdriver
+    page.add_init_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+    )
+    Este script JavaScript é injetado ANTES de qualquer JS da página carregar.
+    Ele sobrescreve a propriedade navigator.webdriver (que normalmente é true
+    em browsers automatizados) para retornar undefined, como em um browser real.
+    É a técnica anti-detecção mais importante do projeto.
+
+  PASSO 4 — Navega até a página de login
+    page.goto(login_url, wait_until="networkidle", timeout=30_000)
+    - wait_until="networkidle": aguarda até que não haja mais requisições de rede
+      por pelo menos 500ms. Isso garante que o JavaScript do reCAPTCHA já foi
+      baixado e executado antes de interagir com o formulário.
+    - timeout=30_000: 30 segundos máximo para a página carregar.
+
+  PASSO 5 — Preenche o formulário
+    page.wait_for_selector(email_selector, timeout=15_000)
+    page.fill(email_selector, email)
+    page.fill(senha_selector, senha)
+    - wait_for_selector: aguarda o campo de email aparecer no DOM (útil para
+      páginas com carregamento dinâmico/SPA).
+    - fill: limpa o campo e digita o valor. Simula digitação real.
+
+  PASSO 6 — Submete o formulário (dispara o reCAPTCHA)
+    page.locator(submit_selector).first.click()
+    Ao clicar em submit, o reCAPTCHA Invisible é acionado automaticamente pelo
+    JavaScript do Google. O Google analisa em background:
+      - Fingerprint do browser
+      - Histórico de interações
+      - Comportamento de mouse/teclado
+      - Presença de flags de automação
+    Se aprovado, o formulário é submetido e o servidor redireciona.
+
+  PASSO 7 — Aguarda redirecionamento de sucesso
+    page.wait_for_url(success_url_pattern, timeout=LOGIN_TIMEOUT_MS)
+    Aguarda até 60 segundos pela URL de sucesso. Se o reCAPTCHA apresentar um
+    desafio visual (raro no Invisible), o usuário pode resolvê-lo manualmente
+    se --no-headless estiver ativo.
+
+  PASSO 8 — Captura os cookies
+    all_cookies = context.cookies()
+    for c in all_cookies:
+        if cookie_names is None or c["name"] in cookie_names:
+            captured_cookies[c["name"]] = c["value"]
+    Extrai todos os cookies do contexto do browser. Se cookie_names foi
+    especificado, filtra apenas os cookies relevantes (ex: session_id, csrf_token).
+
+  PASSO 9 — Tratamento de erros
+    Em caso de falha, salva um screenshot em "login_error.png" para diagnóstico
+    visual do estado da página no momento do erro.
+
+  PASSO 10 — Fecha o browser (bloco finally)
+    browser.close()
+    O browser é SEMPRE fechado ao final, independente de sucesso ou falha.
+    Não fica nenhuma instância de Chromium aberta em background.
+
+────────────────────────────────────────────────────────────────────────────────
+FUNÇÃO: login_async()
+────────────────────────────────────────────────────────────────────────────────
+Assinatura:
+  async def login_async(...) -> dict[str, str]
+
+Propósito:
+  Wrapper assíncrono de _do_login_sync(). Permite usar o mesmo fluxo de login
+  em projetos que usam asyncio (FastAPI, uvicorn, aiohttp, etc.) sem bloquear
+  o event loop principal.
+
+Implementação:
+  loop = asyncio.get_event_loop()
+  return await loop.run_in_executor(
+      _executor,
+      lambda: _do_login_sync(...)
+  )
+
+  - asyncio.get_event_loop(): obtém o loop de eventos atual
+  - run_in_executor(): executa a função síncrona em uma thread separada do pool
+    (_executor), liberando o event loop para processar outras coroutines enquanto
+    o Playwright roda.
+  - lambda: encapsula a chamada com todos os parâmetros nomeados, já que
+    run_in_executor espera um callable sem argumentos.
+
+  O _executor é um ThreadPoolExecutor com max_workers=1, garantindo que apenas
+  uma sessão de Playwright rode por vez (evita conflitos de recursos).
+
+────────────────────────────────────────────────────────────────────────────────
+BLOCO: if __name__ == "__main__" (CLI)
+────────────────────────────────────────────────────────────────────────────────
+Propósito:
+  Permite executar o script diretamente via terminal.
+
+Argumentos aceitos:
+  --url         (obrigatório) URL da página de login
+  --email       (obrigatório) Email de acesso
+  --senha       (obrigatório) Senha
+  --success     (opcional)   Padrão glob da URL pós-login (default: **/dashboard**)
+  --no-headless (flag)       Exibe o browser visualmente (útil para debug)
+
+Exemplo de uso:
+  python bypass.py --url https://site.com/login --email user@email.com --senha abc123
+  python bypass.py --url https://site.com/login --email user@email.com --senha abc123 --no-headless
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. CONSTANTES E CONFIGURAÇÕES GLOBAIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  LOGIN_TIMEOUT_MS = 60_000
+    Tempo máximo (em milissegundos) aguardando o redirecionamento pós-login.
+    60 segundos é suficiente para o reCAPTCHA resolver e o servidor responder.
+    Em conexões lentas ou reCAPTCHAs com desafio visual, pode ser necessário
+    aumentar esse valor.
+
+  _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright")
+    Pool de threads dedicado ao Playwright. max_workers=1 garante execução
+    sequencial (uma sessão por vez). thread_name_prefix facilita identificação
+    em logs e profilers.
+
+  logger = logging.getLogger(__name__)
+    Logger nomeado com o nome do módulo. Permite controle granular de logs
+    quando o módulo é importado por outros projetos.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. FLUXO COMPLETO DO PROJETO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  [CLI / código externo]
+        │
+        ▼
+  _do_login_sync() ou login_async()
+        │
+        ▼
+  Abre Chromium com flags anti-detecção
+        │
+        ▼
+  Injeta script: navigator.webdriver = undefined
+        │
+        ▼
+  Navega até login_url (wait_until="networkidle")
+        │
+        ▼
+  Preenche email + senha
+        │
+        ▼
+  Clica em submit
+        │
+        ▼
+  reCAPTCHA Invisible avalia o browser em background
+        │
+        ├── APROVADO → servidor redireciona para URL de sucesso
+        │       │
+        │       ▼
+        │   Captura cookies de sessão
+        │       │
+        │       ▼
+        │   Fecha browser
+        │       │
+        │       ▼
+        │   Retorna dict { cookie: valor }
+        │       │
+        │       ▼
+        │   Usa cookies em requisições HTTP puras (requests/httpx)
+        │
+        └── REPROVADO / TIMEOUT → lança RuntimeError + salva screenshot
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. SITES QUE USAM reCAPTCHA INVISIBLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+O reCAPTCHA Invisible (v2 invisible e v3) é amplamente adotado por ser
+transparente para o usuário. Exemplos de categorias e sites conhecidos:
+
+  REDES SOCIAIS E COMUNICAÇÃO
+    - Discord (discord.com) — login e criação de conta
+    - Reddit (reddit.com) — criação de conta e login
+    - Twitch (twitch.tv) — criação de conta
+
+  E-COMMERCE E PAGAMENTOS
+    - Shopify (shopify.com) — checkout e criação de loja
+    - Stripe (stripe.com) — formulários de pagamento
+    - Mercado Livre (mercadolivre.com.br) — login e checkout
+
+  SERVIÇOS FINANCEIROS
+    - PayPal (paypal.com) — login e transações
+    - Nubank (nubank.com.br) — formulários web
+    - Banco Inter (bancointer.com.br) — acesso web
+
+  GOVERNO E SERVIÇOS PÚBLICOS
+    - Gov.br (gov.br) — login e serviços digitais
+    - Receita Federal (receita.fazenda.gov.br) — consultas
+    - INSS Digital (meu.inss.gov.br) — acesso ao portal
+
+  EDUCAÇÃO
+    - Coursera (coursera.org) — login e inscrições
+    - Udemy (udemy.com) — criação de conta
+    - Khan Academy (khanacademy.org) — registro
+
+  TECNOLOGIA E SAAS
+    - GitHub (github.com) — criação de conta (em alguns fluxos)
+    - Cloudflare (cloudflare.com) — painel de controle
+    - Zendesk (zendesk.com) — formulários de suporte
+
+  NOTA: A presença do reCAPTCHA pode variar por região, dispositivo e
+  comportamento do usuário. Sites podem alternar entre v2 checkbox, v2 invisible
+  e v3 dependendo do nível de risco detectado pelo Google.
+
+  COMO IDENTIFICAR se um site usa reCAPTCHA Invisible:
+    1. Abra o DevTools (F12) → aba Network
+    2. Filtre por "recaptcha" ou "google.com/recaptcha"
+    3. Se aparecer requisições para "anchor" ou "reload" sem caixinha visível
+       na página, é o Invisible.
+    4. Ou inspecione o HTML e procure por:
+       data-size="invisible" ou grecaptcha.execute()
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. RESUMO DAS TÉCNICAS ANTI-DETECÇÃO USADAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Técnica                              | O que resolve
+  ─────────────────────────────────────┼──────────────────────────────────────
+  --disable-blink-features=            | Remove flag interna do Chrome que
+    AutomationControlled               | indica controle por WebDriver
+  ─────────────────────────────────────┼──────────────────────────────────────
+  navigator.webdriver = undefined      | Esconde a propriedade JS que sites
+  (add_init_script)                    | verificam para detectar automação
+  ─────────────────────────────────────┼──────────────────────────────────────
+  User-Agent real                      | Evita detecção por string de UA
+                                       | genérica ou "HeadlessChrome"
+  ─────────────────────────────────────┼──────────────────────────────────────
+  viewport 1366x768                    | Resolução comum de desktop real
+  ─────────────────────────────────────┼──────────────────────────────────────
+  locale="pt-BR"                       | Simula usuário com idioma configurado
+  ─────────────────────────────────────┼──────────────────────────────────────
+  wait_until="networkidle"             | Garante que o JS do reCAPTCHA
+                                       | carregou antes de interagir
+
+================================================================================
+  FIM DA EXPLICAÇÃO
+================================================================================
